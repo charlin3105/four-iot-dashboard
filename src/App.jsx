@@ -1,6 +1,9 @@
+import client from "./mqtt";
 import React, { useState, useEffect, useRef } from "react";
 import "./App.css";
-import mqtt from "mqtt";
+import html2canvas from "html2canvas";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import {
   Power,
   PowerOff,
@@ -35,6 +38,13 @@ import {
 const now = () => new Date().toLocaleTimeString("fr-FR");
 
 export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(
+    localStorage.getItem("auth_scada") === "true"
+  );
+  const [loginUser, setLoginUser] = useState("");
+  const [loginPass, setLoginPass] = useState("");
+  const [loginError, setLoginError] = useState("");
+
   const [temperature, setTemperature] = useState(22);
   const [tempSeuil, setTempSeuil] = useState(35);
   const [tempRegulation, setTempRegulation] = useState(28);
@@ -56,9 +66,12 @@ export default function App() {
   const [timerRestant, setTimerRestant] = useState(0);
   const [dureeChoisie, setDureeChoisie] = useState(60);
 
-  const [espIp, setEspIp] = useState(localStorage.getItem("esp_ip") || "192.168.137.197");
-  const [modeConnexion, setModeConnexion] = useState(localStorage.getItem("mode_connexion") || "LOCAL");
-  const [mqttClient, setMqttClient] = useState(null);
+  const [espIp, setEspIp] = useState(
+    localStorage.getItem("esp_ip") || "192.168.137.197"
+  );
+  const [modeConnexion, setModeConnexion] = useState(
+    localStorage.getItem("mode_connexion") || "LOCAL"
+  );
   const [statusReseau, setStatusReseau] = useState("Déconnecté");
 
   const [graphData, setGraphData] = useState([]);
@@ -66,12 +79,33 @@ export default function App() {
   const [popup, setPopup] = useState(null);
 
   const popupTimeoutRef = useRef(null);
+  const graphPanelRef = useRef(null);
+  const previousFourOnRef = useRef(false);
 
   const dashboardRef = useRef(null);
   const analyseRef = useRef(null);
   const pilotageRef = useRef(null);
   const etatRef = useRef(null);
   const historiqueRef = useRef(null);
+
+  const seConnecter = (e) => {
+    e.preventDefault();
+
+    if (loginUser === "NELVAROS" && loginPass === "99282227") {
+      localStorage.setItem("auth_scada", "true");
+      setIsAuthenticated(true);
+      setLoginError("");
+    } else {
+      setLoginError("Identifiant ou mot de passe incorrect");
+    }
+  };
+
+  const seDeconnecter = () => {
+    localStorage.removeItem("auth_scada");
+    setIsAuthenticated(false);
+    setLoginUser("");
+    setLoginPass("");
+  };
 
   useEffect(() => {
     localStorage.setItem("esp_ip", espIp);
@@ -97,7 +131,7 @@ export default function App() {
       mode: modeConnexion,
     };
 
-    setHistorique((prev) => [log, ...prev.slice(0, 99)]);
+    setHistorique((prev) => [log, ...prev]);
   };
 
   const formatTemps = (secondes) => {
@@ -121,9 +155,10 @@ export default function App() {
     setTempRegulation(regulation);
     setMargeRegulation(Number(data.margeRegulation ?? 1));
 
-    setFourOn(Boolean(data.fourOn));
+    const nextFourOn = Boolean(data.fourOn);
+    setFourOn(nextFourOn);
     setChauffageActif(Boolean(data.chauffageActif));
-    setLedChauffage(Boolean(data.ledChauffage ?? data.fourOn));
+    setLedChauffage(Boolean(data.ledChauffage ?? data.chauffageActif));
     setRefroidisseurOn(Boolean(data.refroidisseurOn));
     setUrgence(Boolean(data.urgence));
     setSurchauffe(Boolean(data.surchauffe));
@@ -136,66 +171,84 @@ export default function App() {
     setTimerTotal(Number(data.timerTotal ?? 0));
     setTimerRestant(Number(data.timerRestant ?? 0));
 
-    setStatusReseau(modeConnexion === "LOCAL" ? "Local connecté HTTP" : "Cloud connecté MQTT");
+    setStatusReseau(
+      modeConnexion === "LOCAL" ? "Local connecté HTTP" : "Cloud connecté MQTT"
+    );
 
-    setGraphData((prev) => [
-      ...prev.slice(-25),
-      {
-        temps: now(),
-        Temp: Number(temp.toFixed(2)),
-        Regulation: regulation,
-        Seuil: seuil,
-      },
-    ]);
+    const pointGraphique = {
+      temps: now(),
+      Temp: Number(temp.toFixed(2)),
+      Regulation: regulation,
+      Seuil: seuil,
+    };
+
+    setGraphData((prev) => {
+      if (nextFourOn && !previousFourOnRef.current) {
+        return [pointGraphique];
+      }
+
+      if (nextFourOn && previousFourOnRef.current) {
+        return [...prev, pointGraphique];
+      }
+
+      if (!nextFourOn && previousFourOnRef.current) {
+        return [...prev, pointGraphique];
+      }
+
+      return prev;
+    });
+
+    previousFourOnRef.current = nextFourOn;
   };
 
   useEffect(() => {
-    if (modeConnexion !== "CLOUD") return;
+    const handleConnect = () => {
+      console.log("✅ MQTT connecté côté React");
+      client.subscribe("four/etat");
+      if (modeConnexion === "CLOUD") {
+        setStatusReseau("Cloud connecté MQTT");
+      }
+    };
 
-    if (mqttClient) {
-      mqttClient.end(true);
-      setMqttClient(null);
-    }
-
-    setStatusReseau("Connexion cloud...");
-
-    const client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt", {
-      reconnectPeriod: 3000,
-      connectTimeout: 8000,
-    });
-
-    client.on("connect", () => {
-      setStatusReseau("Cloud connecté MQTT");
-      client.subscribe("atelier/four/etat");
-      ajouterHistorique("Connexion au broker MQTT", "Cloud");
-      ajouterPopup("Connexion Cloud MQTT réussie", "blue");
-    });
-
-    client.on("message", (topic, message) => {
-      if (topic === "atelier/four/etat") {
+    const handleMessage = (topic, message) => {
+      if (topic === "four/etat") {
         try {
-          traiterDonneesESP32(JSON.parse(message.toString()));
+          const data = JSON.parse(message.toString());
+          traiterDonneesESP32(data);
         } catch {
           ajouterPopup("Message MQTT non valide", "red");
         }
       }
-    });
+    };
 
-    client.on("offline", () => setStatusReseau("Cloud hors ligne"));
-    client.on("error", () => setStatusReseau("Erreur cloud"));
+    const handleOffline = () => {
+      if (modeConnexion === "CLOUD") setStatusReseau("Cloud hors ligne");
+    };
 
-    setMqttClient(client);
+    const handleError = () => {
+      if (modeConnexion === "CLOUD") setStatusReseau("Erreur cloud MQTT");
+    };
 
-    return () => client.end(true);
+    client.on("connect", handleConnect);
+    client.on("message", handleMessage);
+    client.on("offline", handleOffline);
+    client.on("error", handleError);
+
+    if (client.connected) {
+      client.subscribe("four/etat");
+      if (modeConnexion === "CLOUD") setStatusReseau("Cloud connecté MQTT");
+    }
+
+    return () => {
+      client.removeListener("connect", handleConnect);
+      client.removeListener("message", handleMessage);
+      client.removeListener("offline", handleOffline);
+      client.removeListener("error", handleError);
+    };
   }, [modeConnexion]);
 
   useEffect(() => {
     if (modeConnexion !== "LOCAL") return;
-
-    if (mqttClient) {
-      mqttClient.end(true);
-      setMqttClient(null);
-    }
 
     setStatusReseau("Mode local actif");
 
@@ -212,12 +265,31 @@ export default function App() {
     return () => clearInterval(interval);
   }, [modeConnexion, espIp]);
 
+  useEffect(() => {
+    if (modeConnexion === "CLOUD") {
+      setStatusReseau(client.connected ? "Cloud connecté MQTT" : "Connexion cloud...");
+      client.subscribe("four/etat");
+    }
+  }, [modeConnexion]);
+
   const envoyerCommande = (routeLocal, commandeMqtt, description) => {
     ajouterHistorique(description);
 
+    if (commandeMqtt === "FOUR_ON") {
+      const pointDepart = {
+        temps: now(),
+        Temp: Number(temperature.toFixed(2)),
+        Regulation: tempRegulation,
+        Seuil: tempSeuil,
+      };
+      setGraphData([pointDepart]);
+      previousFourOnRef.current = true;
+    }
+
     if (modeConnexion === "CLOUD") {
-      if (mqttClient && mqttClient.connected) {
-        mqttClient.publish("atelier/four/commandes", commandeMqtt);
+      if (client.connected) {
+        client.publish("four/commande", commandeMqtt);
+        ajouterPopup("Commande envoyée en cloud MQTT", "blue");
       } else {
         ajouterPopup("MQTT non connecté", "red");
       }
@@ -237,8 +309,8 @@ export default function App() {
     setTempRegulation(nouvelleTemp);
 
     envoyerCommande(
-      `/set/regulation?val=${nouvelleTemp}`,
-      `SET_REGULATION:${nouvelleTemp}`,
+      valeur > 0 ? "/regulation/plus" : "/regulation/minus",
+      valeur > 0 ? "TEMP_PLUS" : "TEMP_MOINS",
       `Température de régulation réglée à ${nouvelleTemp}°C`
     );
   };
@@ -248,8 +320,8 @@ export default function App() {
     setTempSeuil(nouveauSeuil);
 
     envoyerCommande(
-      `/set/seuil?val=${nouveauSeuil}`,
-      `SET_SEUIL:${nouveauSeuil}`,
+      valeur > 0 ? "/seuil/plus" : "/seuil/minus",
+      valeur > 0 ? "SEUIL_PLUS" : "SEUIL_MOINS",
       `Seuil critique réglé à ${nouveauSeuil}°C`
     );
   };
@@ -277,23 +349,291 @@ export default function App() {
     );
   };
 
-  const exporterCSV = () => {
-    let contenu = "ID;Heure;Action;Cible;Mode\n";
+  const analyserGraphique = () => {
+    if (graphData.length === 0) {
+      return {
+        lignes: ["Aucune donnée de fonctionnement n'est disponible pour le graphe."],
+        stats: [],
+      };
+    }
 
-    historique.forEach((log) => {
-      contenu += `${log.id};${log.temps};${log.action};${log.cible};${log.mode}\n`;
+    const depart = graphData[0];
+    const fin = graphData[graphData.length - 1];
+    const temperatures = graphData.map((p) => Number(p.Temp));
+    const maxTemp = Math.max(...temperatures);
+    const minTemp = Math.min(...temperatures);
+    const maxPoint = graphData.find((p) => Number(p.Temp) === maxTemp);
+    const minPoint = graphData.find((p) => Number(p.Temp) === minTemp);
+    const depassementsSeuil = graphData.filter((p) => Number(p.Temp) >= Number(p.Seuil));
+    const premierDepassement = depassementsSeuil[0];
+    const pointsRegulation = graphData.filter(
+      (p) => Math.abs(Number(p.Temp) - Number(p.Regulation)) <= 0.5
+    );
+    const premierPointRegulation = pointsRegulation[0];
+    const variation = Number(fin.Temp) - Number(depart.Temp);
+
+    const lignes = [];
+    lignes.push(
+      `Le fonctionnement a commencé à ${depart.temps} avec une température initiale réelle de ${depart.Temp} °C.`
+    );
+    lignes.push(
+      `La température finale enregistrée à ${fin.temps} est de ${fin.Temp} °C.`
+    );
+    lignes.push(
+      `La température minimale observée est ${minTemp.toFixed(2)} °C à ${minPoint?.temps || "-"}.`
+    );
+    lignes.push(
+      `La température maximale observée est ${maxTemp.toFixed(2)} °C à ${maxPoint?.temps || "-"}.`
+    );
+
+    if (variation > 0) {
+      lignes.push(
+        `La tendance globale est une montée thermique de ${variation.toFixed(2)} °C sur la période analysée.`
+      );
+    } else if (variation < 0) {
+      lignes.push(
+        `La tendance globale est une baisse thermique de ${Math.abs(variation).toFixed(2)} °C sur la période analysée.`
+      );
+    } else {
+      lignes.push("La température globale est restée quasiment stable sur la période analysée.");
+    }
+
+    if (premierDepassement) {
+      lignes.push(
+        `Le seuil critique a été dépassé ou atteint pour la première fois à ${premierDepassement.temps} avec ${premierDepassement.Temp} °C.`
+      );
+      lignes.push(
+        `Nombre de mesures au-dessus ou au niveau du seuil : ${depassementsSeuil.length}.`
+      );
+    } else {
+      lignes.push("Aucun dépassement du seuil critique n'a été détecté pendant le fonctionnement.");
+    }
+
+    if (premierPointRegulation) {
+      lignes.push(
+        `La température de régulation a été atteinte ou approchée pour la première fois à ${premierPointRegulation.temps} avec ${premierPointRegulation.Temp} °C.`
+      );
+    } else {
+      lignes.push("La température de régulation n'a pas été clairement atteinte pendant l'enregistrement.");
+    }
+
+    return {
+      lignes,
+      stats: [
+        ["Heure de début", depart.temps],
+        ["Heure de fin", fin.temps],
+        ["Température initiale", `${depart.Temp} °C`],
+        ["Température finale", `${fin.Temp} °C`],
+        ["Température minimale", `${minTemp.toFixed(2)} °C`],
+        ["Température maximale", `${maxTemp.toFixed(2)} °C`],
+        ["Température de régulation", `${fin.Regulation} °C`],
+        ["Température de seuil", `${fin.Seuil} °C`],
+        ["Nombre de mesures", `${graphData.length}`],
+        ["Dépassements du seuil", `${depassementsSeuil.length}`],
+      ],
+    };
+  };
+
+  const exporterRapportGraphiquePDF = async () => {
+    if (graphData.length === 0) {
+      ajouterPopup("Aucune donnée de graphe à exporter", "red");
+      return;
+    }
+
+    const doc = new jsPDF("p", "mm", "a4");
+    const analyse = analyserGraphique();
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(17);
+    doc.text("PROJET NELVAROS LP SARII", 14, 16);
+
+    doc.setFontSize(13);
+    doc.text("Rapport d'analyse thermique", 14, 25);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.text(`Date d'export : ${new Date().toLocaleString("fr-FR")}`, 14, 32);
+    doc.text(`Mode de connexion : ${modeConnexion}`, 14, 38);
+
+    if (graphPanelRef.current) {
+      const canvas = await html2canvas(graphPanelRef.current, {
+        backgroundColor: "#020617",
+        scale: 2,
+      });
+      const imgData = canvas.toDataURL("image/png");
+      doc.addImage(imgData, "PNG", 14, 45, 182, 90);
+    }
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.text("Résumé des mesures", 14, 145);
+
+    autoTable(doc, {
+      startY: 150,
+      head: [["Indicateur", "Valeur"]],
+      body: analyse.stats,
+      styles: { fontSize: 9, cellPadding: 3 },
+      headStyles: { fillColor: [15, 23, 42], textColor: [255, 255, 255] },
+      alternateRowStyles: { fillColor: [240, 246, 255] },
     });
 
-    const blob = new Blob([contenu], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const lien = document.createElement("a");
+    const yAnalyse = doc.lastAutoTable.finalY + 10;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.text("Analyse automatique", 14, yAnalyse);
 
-    lien.href = url;
-    lien.download = `historique_supervision_${Date.now()}.csv`;
-    lien.click();
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    const texteAnalyse = analyse.lignes.join("\n");
+    const lignesAnalyse = doc.splitTextToSize(texteAnalyse, 182);
+    doc.text(lignesAnalyse, 14, yAnalyse + 7);
 
-    URL.revokeObjectURL(url);
+    doc.save(`rapport_graphique_nelvaros_${Date.now()}.pdf`);
   };
+
+  const exporterJournalPDF = () => {
+    const doc = new jsPDF("p", "mm", "a4");
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(17);
+    doc.text("PROJET NELVAROS LP SARII", 14, 16);
+
+    doc.setFontSize(13);
+    doc.text("Journal de traçabilité", 14, 25);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.text(`Date d'export : ${new Date().toLocaleString("fr-FR")}`, 14, 32);
+    doc.text(`Mode de connexion : ${modeConnexion}`, 14, 38);
+    doc.text(`Nombre d'actions enregistrées : ${historique.length}`, 14, 44);
+
+    const lignes = historique.map((log) => [
+      String(log.id).slice(-6),
+      log.temps,
+      log.action,
+      log.cible,
+      log.mode,
+    ]);
+
+    autoTable(doc, {
+      startY: 52,
+      head: [["ID", "Heure", "Action", "Cible", "Mode"]],
+      body: lignes.length ? lignes : [["-", "-", "Aucune action enregistrée", "-", "-"]],
+      styles: { fontSize: 8, cellPadding: 2.5, overflow: "linebreak" },
+      headStyles: { fillColor: [15, 23, 42], textColor: [255, 255, 255] },
+      alternateRowStyles: { fillColor: [240, 246, 255] },
+      columnStyles: {
+        0: { cellWidth: 18 },
+        1: { cellWidth: 28 },
+        2: { cellWidth: 78 },
+        3: { cellWidth: 30 },
+        4: { cellWidth: 28 },
+      },
+      margin: { left: 14, right: 14 },
+      didDrawPage: () => {
+        const page = doc.internal.getNumberOfPages();
+        doc.setFontSize(8);
+        doc.text(`Page ${page}`, 185, 287);
+      },
+    });
+
+    doc.save(`journal_tracabilite_nelvaros_${Date.now()}.pdf`);
+  };
+
+  if (!isAuthenticated) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background: "#020617",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "white",
+          fontFamily: "Arial, sans-serif",
+        }}
+      >
+        <form
+          onSubmit={seConnecter}
+          style={{
+            width: "390px",
+            background: "#0b1524",
+            border: "1px solid #223246",
+            borderRadius: "24px",
+            padding: "35px",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.45)",
+          }}
+        >
+          <h1 style={{ color: "#38bdf8", marginBottom: "10px" }}>
+            PROJET NELVAROS
+          </h1>
+
+          <p style={{ color: "#94a3b8", marginBottom: "25px" }}>
+            LP SARII - Accès sécurisé
+          </p>
+
+          <label>Nom d’utilisateur</label>
+          <input
+            type="text"
+            value={loginUser}
+            onChange={(e) => setLoginUser(e.target.value)}
+            placeholder="NELVAROS"
+            style={{
+              width: "100%",
+              padding: "14px",
+              margin: "8px 0 18px",
+              borderRadius: "12px",
+              border: "1px solid #334155",
+              background: "#020617",
+              color: "white",
+              fontSize: "16px",
+            }}
+          />
+
+          <label>Mot de passe</label>
+          <input
+            type="password"
+            value={loginPass}
+            onChange={(e) => setLoginPass(e.target.value)}
+            placeholder="Mot de passe"
+            style={{
+              width: "100%",
+              padding: "14px",
+              margin: "8px 0 18px",
+              borderRadius: "12px",
+              border: "1px solid #334155",
+              background: "#020617",
+              color: "white",
+              fontSize: "16px",
+            }}
+          />
+
+          {loginError && (
+            <p style={{ color: "#ef4444", fontWeight: "bold" }}>
+              {loginError}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            style={{
+              width: "100%",
+              padding: "15px",
+              borderRadius: "14px",
+              border: "none",
+              background: "#16a34a",
+              color: "white",
+              fontWeight: "bold",
+              fontSize: "16px",
+              cursor: "pointer",
+            }}
+          >
+            SE CONNECTER
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -321,8 +661,8 @@ export default function App() {
         <div className="logo">
           <div className="logo-icon">🎛️</div>
           <div>
-            <h2>THERMO-CONTROL</h2>
-            <p>SUPERVISION SCADA</p>
+            <h2>PROJET NELVAROS</h2>
+            <p>LP SARII</p>
           </div>
         </div>
 
@@ -330,22 +670,31 @@ export default function App() {
           <button onClick={() => scrollToSection(dashboardRef)}>
             <LayoutDashboard size={16} /> Tableau de bord
           </button>
+
           <button onClick={() => scrollToSection(analyseRef)}>
             <BarChart3 size={16} /> Analyse thermique
           </button>
+
           <button onClick={() => scrollToSection(pilotageRef)}>
             <SlidersHorizontal size={16} /> Pilotage du système
           </button>
+
           <button onClick={() => scrollToSection(etatRef)}>
             <ListChecks size={16} /> État des composants
           </button>
+
           <button onClick={() => scrollToSection(historiqueRef)}>
             <History size={16} /> Journal de traçabilité
           </button>
         </nav>
 
         <div className="system-box">
-          <Cpu size={24} className={statusReseau.includes("connecté") ? "green-text" : "red-text"} />
+          <Cpu
+            size={24}
+            className={
+              statusReseau.includes("connecté") ? "green-text" : "red-text"
+            }
+          />
           <div>
             <p style={{ fontSize: "13px" }}>ESP32 STATUS</p>
             <small>{statusReseau}</small>
@@ -356,16 +705,21 @@ export default function App() {
       <div className="main">
         <div ref={dashboardRef} className="header">
           <div>
-            <h1>TABLEAU DE BORD SUPERVISEUR</h1>
-            <p>Four thermique avec régulation impulsionnelle, sécurité seuil et contrôle local/cloud.</p>
+            <h1>PROJET NELVAROS LP SARII</h1>
           </div>
 
           <div className="header-actions">
-            <button className={`badge ${modeConnexion === "LOCAL" ? "green" : "dark"}`} onClick={() => setModeConnexion("LOCAL")}>
+            <button
+              className={`badge ${modeConnexion === "LOCAL" ? "green" : "dark"}`}
+              onClick={() => setModeConnexion("LOCAL")}
+            >
               <Wifi size={14} /> LOCAL
             </button>
 
-            <button className={`badge ${modeConnexion === "CLOUD" ? "green" : "dark"}`} onClick={() => setModeConnexion("CLOUD")}>
+            <button
+              className={`badge ${modeConnexion === "CLOUD" ? "green" : "dark"}`}
+              onClick={() => setModeConnexion("CLOUD")}
+            >
               <Cloud size={14} /> CLOUD MQTT
             </button>
 
@@ -400,49 +754,161 @@ export default function App() {
               {systemOk ? "SYSTÈME NOMINAL" : "ERREUR / ARRÊT"}
             </div>
 
-            <div className="admin">👤 ADMIN</div>
+            <button className="admin" onClick={seDeconnecter}>
+              👤 NELVAROS | DÉCONNEXION
+            </button>
 
-            <button className="icon-button" onClick={basculerSimulation} title="Simulation">
+            <button
+              className="icon-button"
+              onClick={basculerSimulation}
+              title="Simulation"
+            >
               <RefreshCw size={16} className={simulation ? "green-text" : ""} />
             </button>
           </div>
         </div>
 
-        {urgence && <div className="big-alert danger">⚠️ ARRÊT D’URGENCE : SYSTÈME COUPÉ.</div>}
-        {surchauffe && !urgence && <div className="big-alert danger">🚨 TEMPÉRATURE SEUIL ATTEINTE : LED ROUGE CLIGNOTANTE.</div>}
+        {urgence && (
+          <div className="big-alert danger">
+            ⚠️ ARRÊT D’URGENCE : SYSTÈME COUPÉ.
+          </div>
+        )}
+
+        {surchauffe && !urgence && (
+          <div className="big-alert danger">
+            🚨 TEMPÉRATURE SEUIL ATTEINTE : LED ROUGE CLIGNOTANTE.
+          </div>
+        )}
+
         {simulation && <div className="big-alert">🤖 MODE SIMULATION ACTIVÉ.</div>}
-        {timerActif && <div className="big-alert">⏱️ MINUTERIE ACTIVE : temps restant {formatTemps(timerRestant)}.</div>}
+
+        {timerActif && (
+          <div className="big-alert">
+            ⏱️ MINUTERIE ACTIVE : temps restant {formatTemps(timerRestant)}.
+          </div>
+        )}
 
         <div className="cards">
-          <Card icon={<Thermometer size={24} />} title="TEMPÉRATURE ACTUELLE DU FOUR" value={`${temperature.toFixed(2)} °C`} note="Capteur DS18B20" color={surchauffe ? "red" : "blue"} />
-          <Card icon={<Target size={24} />} title="TEMPÉRATURE DE RÉGULATION" value={`${tempRegulation} °C`} note={`Relance à -${margeRegulation}°C`} color="green" />
-          <Card icon={<AlertTriangle size={24} />} title="TEMPÉRATURE DE SEUIL" value={`${tempSeuil} °C`} note="Sécurité thermique" color="red" />
-          <Card icon={<Flame size={24} />} title="CHAUFFAGE" value={ledChauffage ? "ACTIF" : "INACTIF"} note={chauffageActif ? "Plaque réellement alimentée" : "Plaque coupée"} color={ledChauffage ? "green" : "gray"} />
-          <Card icon={<Snowflake size={24} />} title="REFROIDISSEUR" value={refroidisseurOn ? "ACTIF" : "INACTIF"} note="Ventilateur" color={refroidisseurOn ? "blue" : "gray"} />
-          <Card icon={<Clock size={24} />} title="MINUTERIE" value={timerActif ? formatTemps(timerRestant) : "NON ACTIVE"} note={fourOn ? "Réglable" : "Four éteint"} color={timerActif ? "blue" : "gray"} />
+          <Card
+            icon={<Thermometer size={24} />}
+            title="TEMPÉRATURE ACTUELLE DU FOUR"
+            value={`${temperature.toFixed(2)} °C`}
+            note="Capteur DS18B20"
+            color={surchauffe ? "red" : "blue"}
+          />
+
+          <Card
+            icon={<Target size={24} />}
+            title="TEMPÉRATURE DE RÉGULATION"
+            value={`${tempRegulation} °C`}
+            note="Régulation automatique"
+            color="green"
+          />
+
+          <Card
+            icon={<AlertTriangle size={24} />}
+            title="TEMPÉRATURE DE SEUIL"
+            value={`${tempSeuil} °C`}
+            note="Sécurité thermique"
+            color="red"
+          />
+
+          <Card
+            icon={<Flame size={24} />}
+            title="CHAUFFAGE"
+            value={ledChauffage ? "ACTIF" : "INACTIF"}
+            note={chauffageActif ? "Plaque réellement alimentée" : "Plaque coupée"}
+            color={ledChauffage ? "green" : "gray"}
+          />
+
+          <Card
+            icon={<Snowflake size={24} />}
+            title="REFROIDISSEUR"
+            value={refroidisseurOn ? "ACTIF" : "INACTIF"}
+            note="Ventilateur"
+            color={refroidisseurOn ? "blue" : "gray"}
+          />
+
+          <Card
+            icon={<Clock size={24} />}
+            title="MINUTERIE"
+            value={timerActif ? formatTemps(timerRestant) : "NON ACTIVE"}
+            note={fourOn ? "Réglable" : "Four éteint"}
+            color={timerActif ? "blue" : "gray"}
+          />
         </div>
 
         <div className="grid">
-          <div ref={analyseRef} className="panel">
+          <div ref={(el) => { analyseRef.current = el; graphPanelRef.current = el; }} className="panel">
             <div className="panel-title">
               <div>
                 <h3>ANALYSE THERMIQUE EN TEMPS RÉEL</h3>
-                <p>Température réelle, régulation et seuil</p>
+                <p>Évolution complète conservée depuis le démarrage</p>
               </div>
+
+              <button
+                className="badge dark"
+                style={{ cursor: "pointer", gap: 6 }}
+                onClick={exporterRapportGraphiquePDF}
+              >
+                <Download size={14} /> RAPPORT GRAPHIQUE PDF
+              </button>
             </div>
 
             <div style={{ width: "100%", height: 320, marginTop: 14 }}>
               <ResponsiveContainer>
                 <LineChart data={graphData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-                  <XAxis dataKey="temps" stroke="#6b7280" fontSize={11} />
-                  <YAxis stroke="#6b7280" fontSize={11} domain={[(dataMin) => dataMin - 2, (dataMax) => dataMax + 5]} />
-                  <Tooltip contentStyle={{ background: "#0b1524", borderColor: "#223246", color: "white" }} />
-                  <ReferenceLine y={tempRegulation} stroke="var(--green)" strokeDasharray="5 5" />
-                  <ReferenceLine y={tempSeuil} stroke="var(--red)" strokeDasharray="3 3" />
-                  <Line type="monotone" dataKey="Temp" stroke="var(--blue)" strokeWidth={3} dot={false} isAnimationActive={false} />
-                  <Line type="monotone" dataKey="Regulation" stroke="var(--green)" strokeWidth={2} dot={false} isAnimationActive={false} />
-                  <Line type="monotone" dataKey="Seuil" stroke="var(--red)" strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <XAxis dataKey="temps" stroke="#6b7280" fontSize={11} interval="preserveStartEnd" />
+                  <YAxis
+                    stroke="#6b7280"
+                    fontSize={11}
+                    domain={[
+                      (dataMin) => dataMin - 2,
+                      (dataMax) => dataMax + 5,
+                    ]}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: "#0b1524",
+                      borderColor: "#223246",
+                      color: "white",
+                    }}
+                  />
+                  <ReferenceLine
+                    y={tempRegulation}
+                    stroke="var(--green)"
+                    strokeDasharray="5 5"
+                  />
+                  <ReferenceLine
+                    y={tempSeuil}
+                    stroke="var(--red)"
+                    strokeDasharray="3 3"
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="Temp"
+                    stroke="var(--blue)"
+                    strokeWidth={3}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="Regulation"
+                    stroke="var(--green)"
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="Seuil"
+                    stroke="var(--red)"
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -482,8 +948,8 @@ export default function App() {
               <p>Historique des commandes et modifications</p>
             </div>
 
-            <button className="badge dark" style={{ cursor: "pointer", gap: 6 }} onClick={exporterCSV}>
-              <Download size={14} /> EXPORT CSV
+            <button className="badge dark" style={{ cursor: "pointer", gap: 6 }} onClick={exporterJournalPDF}>
+              <Download size={14} /> JOURNAL PDF
             </button>
           </div>
 
